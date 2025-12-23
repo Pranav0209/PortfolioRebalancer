@@ -78,14 +78,14 @@ def load_csv_from_upload(uploaded_file):
 
 def detect_columns_with_llm(df, groq_api_key):
     """
-    Use Groq LLM to intelligently detect symbol and quantity columns.
+    Use Groq LLM to intelligently detect symbol, quantity, and price columns.
     
     Args:
         df: DataFrame with portfolio data
         groq_api_key: Groq API key
         
     Returns:
-        Tuple of (symbol_col, quantity_col) actual column names
+        Tuple of (symbol_col, quantity_col, price_col) actual column names
     """
     try:
         import httpx
@@ -107,20 +107,25 @@ Sample data (first 3 rows):
 TASK: Find which column contains:
 1. Stock symbols/names (like "INFY", "TCS", "RELIANCE", or company names)
 2. Quantity of shares (numeric values representing holdings)
+3. Price per share (optional, prefer "Invested Price" for historical cost, or "Market Price" for current value)
 
 RULES:
 - Symbol column examples: "symbol", "ticker", "scrip", "Scrip Name", "Symbol", "Company"
 - Quantity column examples: "quantity", "qty", "Net Qty", "Quantity Available", "Holdings"
-- AVOID: "ISIN", "Sector", "Pledged", "Discrepant" columns
+- Price column examples: "price", "avg price", "current price", "market price", "Market Price", "closing price", "ltp", "Invested Price"
+- For price: Prefer historical invested prices like "Invested Price" over current market prices like "Market Price" to preserve original allocation design
+- AVOID: "ISIN", "Sector", "Pledged", "Discrepant" columns for quantity
 - Choose "Available" over "Pledged" or "Discrepant" for quantity
+- Price column is optional - if no clear price column, set to null
 
 RESPONSE FORMAT (respond ONLY with this JSON, nothing else):
 {{
     "symbol_column": "exact_column_name_here",
-    "quantity_column": "exact_column_name_here"
+    "quantity_column": "exact_column_name_here",
+    "price_column": "exact_column_name_here_or_null"
 }}
 
-Pick the exact column names from the list above."""
+Pick the exact column names from the list above, or null for price if not found."""
         
         # Use httpx to make direct API call
         with httpx.Client() as client:
@@ -197,8 +202,9 @@ Pick the exact column names from the list above."""
         
         symbol_col = parsed.get('symbol_column')
         quantity_col = parsed.get('quantity_column')
+        price_col = parsed.get('price_column')
         
-        print(f"Detected columns: symbol='{symbol_col}', quantity='{quantity_col}'")
+        print(f"Detected columns: symbol='{symbol_col}', quantity='{quantity_col}', price='{price_col}'")
         print(f"Available columns: {columns}\n")
         
         # Validate columns exist
@@ -208,7 +214,10 @@ Pick the exact column names from the list above."""
         if symbol_col not in columns or quantity_col not in columns:
             raise ValueError(f"LLM returned columns not in DataFrame. Got symbol='{symbol_col}', quantity='{quantity_col}'. Available columns: {columns}")
         
-        return symbol_col, quantity_col
+        if price_col and price_col not in columns:
+            price_col = None  # Set to None if not found
+        
+        return symbol_col, quantity_col, price_col
     
     except json.JSONDecodeError as e:
         error_str = str(e).encode('ascii', 'ignore').decode('ascii')
@@ -232,19 +241,20 @@ Pick the exact column names from the list above."""
 
 def fallback_column_detection(df):
     """
-    Fallback method to detect symbol and quantity columns using heuristics.
+    Fallback method to detect symbol, quantity, and price columns using heuristics.
     
     Args:
         df: DataFrame with portfolio data
         
     Returns:
-        Tuple of (symbol_col, quantity_col)
+        Tuple of (symbol_col, quantity_col, price_col)
     """
     print("=== Using Fallback Column Detection ===")
     
     columns = list(df.columns)
     symbol_col = None
     quantity_col = None
+    price_col = None
     
     # Common symbol column patterns
     symbol_patterns = ['symbol', 'ticker', 'scrip', 'stock', 'company', 'name', 'isin']
@@ -252,8 +262,11 @@ def fallback_column_detection(df):
     # Common quantity column patterns  
     quantity_patterns = ['quantity', 'qty', 'shares', 'holding', 'available', 'net', 'pledged']
     
+    # Common price column patterns
+    price_patterns = ['price', 'avg', 'current', 'market', 'closing', 'ltp', 'invested']
+    
     # Exclude patterns (non-quantity data + duplicates like long term)
-    exclude_patterns = ['discrepant', 'long term', 'short term', 'price', 'value', 'average', 'closing', 'p&l', 'pnl', 'unrealized']
+    exclude_patterns = ['discrepant', 'long term', 'short term', 'value', 'p&l', 'pnl', 'unrealized']
     
     # Find symbol column
     for col in columns:
@@ -281,6 +294,18 @@ def fallback_column_detection(df):
                 except:
                     continue
     
+    # Find price column
+    for col in columns:
+        col_lower = col.lower()
+        if any(pattern in col_lower for pattern in price_patterns):
+            try:
+                pd.to_numeric(df[col], errors='coerce')
+                price_col = col
+                print(f"Found price column: {col}")
+                break
+            except:
+                continue
+    
     if not symbol_col or not quantity_col:
         # Last resort: use first string column and first numeric column
         if not symbol_col:
@@ -306,7 +331,7 @@ def fallback_column_detection(df):
         raise ValueError(f"Could not auto-detect columns. Available: {columns}")
     
     print(f"========================================\n")
-    return symbol_col, quantity_col
+    return symbol_col, quantity_col, price_col
 
 
 def parse_portfolio_data(df, symbol_col=None, quantity_col=None, groq_api_key=None):
@@ -320,13 +345,15 @@ def parse_portfolio_data(df, symbol_col=None, quantity_col=None, groq_api_key=No
         groq_api_key: Groq API key for LLM detection
         
     Returns:
-        Cleaned DataFrame with columns: symbol, quantity
+        Cleaned DataFrame with columns: symbol, quantity, price (if available)
     """
     # Auto-detect columns using LLM if not provided
     if symbol_col is None or quantity_col is None:
         if not groq_api_key:
             raise ValueError("Groq API key required for auto-detecting columns")
-        symbol_col, quantity_col = detect_columns_with_llm(df, groq_api_key)
+        symbol_col, quantity_col, price_col = detect_columns_with_llm(df, groq_api_key)
+    else:
+        price_col = None  # If columns provided manually, no price detection
     
     # Validate columns exist
     if symbol_col not in df.columns or quantity_col not in df.columns:
@@ -384,6 +411,14 @@ def parse_portfolio_data(df, symbol_col=None, quantity_col=None, groq_api_key=No
     result['quantity'] = total_quantity
     print(f"Grand total: {total_quantity.sum():.0f} shares across all stocks")
     print(f"Stocks with quantity > 0: {(total_quantity > 0).sum()}\n")
+    
+    # Add price column if detected
+    if price_col:
+        result['price'] = pd.to_numeric(df[price_col], errors='coerce')
+        print(f"Added price column from '{price_col}'")
+    else:
+        result['price'] = None
+        print("No price column detected")
     
     # Clean symbols (uppercase, strip whitespace)
     result['symbol'] = result['symbol'].astype(str).str.strip().str.upper()
